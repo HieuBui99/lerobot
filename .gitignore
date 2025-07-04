@@ -173,3 +173,7 @@ outputs/
 
 # Dev folders
 .cache/*
+# Cython debug symbols
+cython_debug/
+
+/datasets
