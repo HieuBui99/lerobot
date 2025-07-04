@@ -42,6 +42,50 @@ from lerobot.robots import Robot
 from lerobot.types import PolicyAction
 
 
+def log_control_info(robot: Robot, dt_s, episode_index=None, frame_index=None, fps=None):
+    log_items = []
+    if episode_index is not None:
+        log_items.append(f"ep:{episode_index}")
+    if frame_index is not None:
+        log_items.append(f"frame:{frame_index}")
+
+    def log_dt(shortname, dt_val_s):
+        nonlocal log_items, fps
+        info_str = f"{shortname}:{dt_val_s * 1000:5.2f} ({1 / dt_val_s:3.1f}hz)"
+        if fps is not None:
+            actual_fps = 1 / dt_val_s
+            if actual_fps < fps - 1:
+                info_str = colored(info_str, "yellow")
+        log_items.append(info_str)
+
+    # total step time displayed in milliseconds and its frequency
+    log_dt("dt", dt_s)
+
+    # TODO(aliberts): move robot-specific logs logic in robot.print_logs()
+    if not robot.robot_type.startswith("stretch") or "omy" in robot.robot_type:
+        for name in robot.leader_arms:
+            key = f"read_leader_{name}_pos_dt_s"
+            if key in robot.logs:
+                log_dt("dtRlead", robot.logs[key])
+
+        for name in robot.follower_arms:
+            key = f"write_follower_{name}_goal_pos_dt_s"
+            if key in robot.logs:
+                log_dt("dtWfoll", robot.logs[key])
+
+            key = f"read_follower_{name}_pos_dt_s"
+            if key in robot.logs:
+                log_dt("dtRfoll", robot.logs[key])
+
+        for name in robot.cameras:
+            key = f"read_camera_{name}_dt_s"
+            if key in robot.logs:
+                log_dt(f"dtR{name}", robot.logs[key])
+
+    info_str = " ".join(log_items)
+    logging.info(info_str)
+
+
 @cache
 def is_headless():
     """

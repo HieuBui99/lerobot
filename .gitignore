@@ -176,3 +176,7 @@ outputs/
 *.urdf
 *.xml
 *.part
+# Cython debug symbols
+cython_debug/
+
+/datasets
