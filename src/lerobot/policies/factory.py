@@ -160,7 +160,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         return MolmoAct2Policy
 =======
     elif name == "flow":
-        from lerobot.common.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
+        from lerobot.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
 
         return FlowPolicy
 >>>>>>> d09444c0 (flow matching)
