@@ -137,6 +137,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+<<<<<<< HEAD
     elif name == "groot":
         from .groot.modeling_groot import GrootPolicy
 
@@ -157,6 +158,12 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .molmoact2.modeling_molmoact2 import MolmoAct2Policy
 
         return MolmoAct2Policy
+=======
+    elif name == "flow":
+        from lerobot.common.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
+
+        return FlowPolicy
+>>>>>>> d09444c0 (flow matching)
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -201,6 +208,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return GaussianActorConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
+<<<<<<< HEAD
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
@@ -211,6 +219,12 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return EO1Config(**kwargs)
     elif policy_type == "molmoact2":
         return MolmoAct2Config(**kwargs)
+=======
+    elif policy_type == "reward_classifier":
+        return RewardClassifierConfig(**kwargs)
+    elif policy_type == "flow":
+        return FlowConfig(**kwargs)
+>>>>>>> d09444c0 (flow matching)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)

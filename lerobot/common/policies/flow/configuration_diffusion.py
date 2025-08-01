@@ -16,13 +16,13 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-from lerobot.common.optim.optimizers import AdamConfig
+from lerobot.common.optim.optimizers import AdamConfig, DiscriminativeLRAdamConfig
 from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 
 
-@PreTrainedConfig.register_subclass("diffusion")
+@PreTrainedConfig.register_subclass("flow")
 @dataclass
 class DiffusionConfig(PreTrainedConfig):
     """Configuration class for DiffusionPolicy.
@@ -157,7 +157,20 @@ class DiffusionConfig(PreTrainedConfig):
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
-    scheduler_warmup_steps: int = 500
+    scheduler_warmup_steps: int = 1000
+
+    #transformer hyperparameters
+    use_transformer: bool = True
+    n_layer: int = 8
+    n_head: int = 4
+    p_drop_emb: float = 0.0
+    p_drop_attn: float = 0.3
+    causal_attn: bool = True
+    n_cond_layers: int = 0
+
+    # flow matching huperparameters
+    ode_step_size: float | None = None
+
 
     def __post_init__(self):
         super().__post_init__()
@@ -173,7 +186,7 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
+        supported_noise_schedulers = ["DDPM", "DDIM", "flow", "flow_match_heun_discrete"]
         if self.noise_scheduler_type not in supported_noise_schedulers:
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
@@ -190,7 +203,13 @@ class DiffusionConfig(PreTrainedConfig):
             )
 
     def get_optimizer_preset(self) -> AdamConfig:
-        return AdamConfig(
+        # return AdamConfig(
+        #     lr=self.optimizer_lr,
+        #     betas=self.optimizer_betas,
+        #     eps=self.optimizer_eps,
+        #     weight_decay=self.optimizer_weight_decay,
+        # )
+        return DiscriminativeLRAdamConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,
@@ -215,11 +234,11 @@ class DiffusionConfig(PreTrainedConfig):
                         f"for `crop_shape` and {image_ft.shape} for "
                         f"`{key}`."
                     )
-
         # Check that all input images have the same shape.
         first_image_key, first_image_ft = next(iter(self.image_features.items()))
         for key, image_ft in self.image_features.items():
             if image_ft.shape != first_image_ft.shape:
+                continue
                 raise ValueError(
                     f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                 )

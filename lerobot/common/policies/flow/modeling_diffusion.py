@@ -21,8 +21,8 @@ TODO(alexander-soare):
 """
 
 import math
-from collections import deque
-from typing import Callable
+from collections import deque, namedtuple
+from typing import Callable, Tuple
 
 import einops
 import numpy as np
@@ -31,7 +31,13 @@ import torch.nn.functional as F  # noqa: N812
 import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_flow_match_heun_discrete import FlowMatchHeunDiscreteScheduler
+from flow_matching.path import AffineProbPath
+from flow_matching.path.scheduler import CondOTScheduler
+from flow_matching.solver import ODESolver
+from flow_matching.utils import ModelWrapper
 from torch import Tensor, nn
+from torch.distributions import Beta
 
 from lerobot.common.constants import OBS_ENV_STATE, OBS_STATE
 from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
@@ -43,6 +49,115 @@ from lerobot.common.policies.utils import (
     get_output_shape,
     populate_queues,
 )
+
+
+class CondOTFlowMatchingScheduler():
+    def __init__(self, ode_step_size: float | None = None, **kwargs):
+        self.path = AffineProbPath(scheduler=CondOTScheduler())
+        self.ode_step_size = ode_step_size
+        self.num_inference_steps = 20
+
+    def sample_path(self, x_1: Tensor, x_0: Tensor, t: Tensor) -> Tensor:
+        """
+        Add noise to the data using the affine probability path.
+        """
+        path_sample = self.path.sample(t=t, x_0=x_0, x_1=x_1)
+        return path_sample
+
+    def sample(self, velocity_model: nn.Module, batch_size: int, **model_extras) -> Tensor:
+        """
+        Sample from the flow matching model using the provided velocity model.
+        """
+
+        device = get_device_from_parameters(velocity_model)
+        
+        x_init = torch.randn(
+            batch_size, velocity_model.config.horizon, velocity_model.config.action_feature.shape[0], 
+            dtype=get_dtype_from_parameters(velocity_model), device=device
+        )
+        time_grid = torch.linspace(0, 1, self.num_inference_steps).to(device=device)
+        
+        if velocity_model.config.prediction_type == "epsilon":
+            wrapper = VelocityModelWrwapper(velocity_model)
+            model_extras["path"] = self.path
+        else:
+            wrapper = velocity_model
+        solver = ODESolver(velocity_model=wrapper)
+        sol = solver.sample(time_grid=time_grid, x_init=x_init, method='midpoint', step_size=self.ode_step_size, **model_extras)
+        return sol
+    
+    def set_timesteps(self, num_inference_steps: int):
+        """
+        Set the number of inference steps for the scheduler.
+        """
+        self.num_inference_steps = num_inference_steps
+
+
+class VelocityModelWrwapper(ModelWrapper):
+    def __init__(self, denoiser):
+        super().__init__(denoiser)
+
+    def forward(self, x, t, **kwargs):
+        x_0_pred = super().forward(x, t, **kwargs)
+        # breakpoint()
+        # handle singularity
+        if t == 0:
+            scheduler_output = kwargs['path'].scheduler(t)
+            d_sigma_t = scheduler_output.d_sigma_t
+            return d_sigma_t * x
+        return kwargs["path"].epsilon_to_velocity(x_0_pred, x_t=x, t=t)
+
+CondOTPath = namedtuple('CondOTPath', ["x_t", "x_0", "x_1", "dx_t"])
+
+class TruncatedFlowMatchingScheduler():
+    def __init__(self, noise_beta_alpha: float = 1.5, noise_beta_beta: float = 1.0, noise_s=0.999, num_train_timesteps=1000, **kwargs):
+        self.num_inference_steps = 10
+        self.num_timestep_buckets = num_train_timesteps
+        self.noise_s = noise_s
+        self.beta_dist = Beta(noise_beta_alpha, noise_beta_beta)
+
+    def sample_time(self, bs, device, dtype):
+        sample = self.beta_dist.sample((bs, )).to(device=device, dtype=dtype)
+        return (self.noise_s - sample) / self.noise_s
+    
+    def sample_path(self, x_1: Tensor, x_0: Tensor, t: Tensor) -> CondOTPath:
+        """
+        Add noise to the data using the affine probability path.
+        """
+        t = t[:, None, None] # (bs, 1, 1)
+        x_t = (1 - t) * x_0  + t * x_1
+        dx_t = x_1 - x_0
+        return CondOTPath(x_t=x_t, x_0=x_0, x_1=x_1, dx_t=dx_t)
+    
+    def set_timesteps(self, num_inference_steps: int):
+        """
+        Set the number of inference steps for the scheduler.
+        """
+        self.num_inference_steps = 10
+
+    def sample(self, velocity_model: nn.Module, batch_size: int, global_cond: Tensor) -> Tensor:
+        """
+        Sample from the flow matching model using the provided velocity model.
+        """
+        device = get_device_from_parameters(velocity_model)
+        
+        actions = torch.randn(
+            batch_size, velocity_model.config.horizon, velocity_model.config.action_feature.shape[0], 
+            dtype=get_dtype_from_parameters(velocity_model), device=device
+        )
+
+        dt = 1.0 / self.num_inference_steps
+        for t in range(self.num_inference_steps):
+            t_cont = t / float(self.num_inference_steps)
+            t_discrete = int(t_cont * self.num_timestep_buckets)
+
+            t_tensor = torch.full((batch_size, ), t_discrete, dtype=torch.long, device=device)
+
+            # Predict model output.
+            model_output = velocity_model(actions, t_tensor, global_cond=global_cond)
+
+            actions = actions + dt * model_output
+        return actions
 
 
 class DiffusionPolicy(PreTrainedPolicy):
@@ -85,8 +200,20 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.reset()
 
-    def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+    # def get_optim_params(self) -> dict:
+    #     return self.diffusion.parameters()
+    def get_optim_params(self) -> dict[str, list[Tensor]]:
+        """Get the parameters of the diffusion model for optimization.
+
+        Returns:
+            dict[str, list[Tensor]]: A dictionary mapping parameter group names to lists of parameters.
+        """
+        optim_params = {
+            "diffusion": self.diffusion.net.parameters(),
+        }
+        if self.config.image_features:
+            optim_params["rgb_encoder"] = self.diffusion.rgb_encoder.parameters()
+        return optim_params
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -166,6 +293,13 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         return DDPMScheduler(**kwargs)
     elif name == "DDIM":
         return DDIMScheduler(**kwargs)
+    elif name == "flow_match_heun_discrete":
+        print("Using flow matching scheduler with Heun's method for diffusion policy.")
+        return FlowMatchHeunDiscreteScheduler(**kwargs)
+    elif name == "flow":
+        print("Using flow matching scheduler for diffusion policy.")
+        # return CondOTFlowMatchingScheduler(**kwargs)
+        return TruncatedFlowMatchingScheduler(**kwargs)
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
@@ -189,7 +323,10 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        if config.use_transformer:
+            self.net = DiffusionTransformer(config, cond_dim=global_cond_dim)
+        else:
+            self.net = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -200,10 +337,13 @@ class DiffusionModel(nn.Module):
             clip_sample=config.clip_sample,
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
+            # ode_step_size=config.ode_step_size,
         )
 
-        if config.num_inference_steps is None:
+        if config.num_inference_steps is None and config.noise_scheduler_type != "flow":
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+        elif config.noise_scheduler_type == "flow":
+            self.num_inference_steps = 10
         else:
             self.num_inference_steps = config.num_inference_steps
 
@@ -224,16 +364,21 @@ class DiffusionModel(nn.Module):
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
-        for t in self.noise_scheduler.timesteps:
-            # Predict model output.
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
-            # Compute previous image: x_t -> x_t-1
-            sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
-
+        if self.config.noise_scheduler_type != "flow":
+            for t in self.noise_scheduler.timesteps:
+                # Predict model output.
+                model_output = self.net(
+                    sample,
+                    torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                )
+                # Compute previous image: x_t -> x_t-1
+                sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+        else:
+            # Flow matching scheduler.
+            # model_extras = {"global_cond": global_cond} if global_cond is not None else {}
+            # sample = self.noise_scheduler.sample(self.net, batch_size, generator=generator, **model_extras)
+            sample = self.noise_scheduler.sample(self.net, batch_size, global_cond=global_cond)
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
@@ -330,28 +475,43 @@ class DiffusionModel(nn.Module):
         trajectory = batch["action"]
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
+        if self.config.noise_scheduler_type != "flow":
+            # Sample a random noising timestep for each item in the batch.
+            timesteps = torch.randint(
+                low=0,
+                high=self.noise_scheduler.config.num_train_timesteps,
+                size=(trajectory.shape[0],),
+                device=trajectory.device,
+            ).long()
+            # Add noise to the clean trajectories according to the noise magnitude at each timestep.
+            if self.config.noise_scheduler_type == "flow_match_heun_discrete":
+                noisy_trajectory = self.noise_scheduler.scale_noise(trajectory, timesteps, eps)
+            else:
+                noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+        else:
+            # timesteps = torch.rand(trajectory.shape[0], device=trajectory.device)
+            t = self.noise_scheduler.sample_time(
+                trajectory.shape[0], device=trajectory.device, dtype=trajectory.dtype)
+            path_sample = self.noise_scheduler.sample_path(
+                x_1=trajectory, x_0=eps, t=t
+            )
+            noisy_trajectory = path_sample.x_t
+            timesteps = (t * self.noise_scheduler.num_timestep_buckets).long()
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        pred = self.net(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch["action"]
+        if self.config.noise_scheduler_type != "flow":
+            if self.config.prediction_type == "epsilon":
+                target = eps
+            elif self.config.prediction_type == "sample":
+                target = batch["action"]
+            else:
+                raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
         else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
-
+            # target = path_sample.x_0 if self.config.prediction_type == "epsilon" else path_sample.dx_t
+            target = path_sample.dx_t
         loss = F.mse_loss(pred, target, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
@@ -662,11 +822,11 @@ class DiffusionConditionalUnet1d(nn.Module):
             nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
         )
 
-    def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
+    def forward(self, x: Tensor, t: Tensor | int, global_cond=None, **kwargs) -> Tensor:
         """
         Args:
             x: (B, T, input_dim) tensor for input to the Unet.
-            timestep: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            t: (B,) tensor of (timestep_we_are_denoising_from - 1).
             global_cond: (B, global_cond_dim)
             output: (B, T, input_dim)
         Returns:
@@ -675,7 +835,13 @@ class DiffusionConditionalUnet1d(nn.Module):
         # For 1D convolutions we'll need feature dimension first.
         x = einops.rearrange(x, "b t d -> b d t")
 
-        timesteps_embed = self.diffusion_step_encoder(timestep)
+        if t.dim() == 0:
+            # If t is a scalar, we need to unsqueeze it to match the batch size.
+            t = t.unsqueeze(0)
+            t = t.expand(x.shape[0])  # (B,)
+        assert t.dim() == 1, f"Expected t to be a 1D tensor, got {t.dim()}D tensor."
+
+        timesteps_embed = self.diffusion_step_encoder(t)
 
         # If there is a global conditioning feature, concatenate it to the timestep embedding.
         if global_cond is not None:
@@ -763,3 +929,263 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         out = self.conv2(out)
         out = out + self.residual_conv(x)
         return out
+
+
+class DiffusionTransformer(nn.Module):
+    """Transformer-based diffusion model for action generation."""
+
+    def __init__(self, config: DiffusionConfig, cond_dim: int):
+        super().__init__()
+        self.config = config
+
+        # conditioning dimension used for positional embeddings
+        # conditioning over input observation steps (n_obs_steps) + time (1)
+        t_cond = 1 + config.n_obs_steps
+
+        input_dim = config.action_feature.shape[0]  # input dimension of the model
+        # input embedding stem
+        self.input_emb = nn.Linear(input_dim, config.diffusion_step_embed_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, config.horizon, config.diffusion_step_embed_dim))
+        self.drop = nn.Dropout(config.p_drop_emb)
+
+        # cond encoder
+        self.time_emb = DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim)
+
+        self.cond_obs_emb = nn.Linear(cond_dim, config.diffusion_step_embed_dim)
+        self.encoder = None
+
+        self.cond_pos_emb = nn.Parameter(torch.zeros(1, t_cond, config.diffusion_step_embed_dim))
+        if config.n_cond_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=config.diffusion_step_embed_dim,
+                nhead=config.n_head,
+                dim_feedforward=4 * config.diffusion_step_embed_dim,
+                dropout=config.p_drop_attn,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer=encoder_layer, num_layers=config.n_cond_layers)
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(config.diffusion_step_embed_dim, 4 * config.diffusion_step_embed_dim),
+                nn.Mish(),
+                nn.Linear(4 * config.diffusion_step_embed_dim, config.diffusion_step_embed_dim),
+            )
+        # decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=config.diffusion_step_embed_dim,
+            nhead=config.n_head,
+            dim_feedforward=4 * config.diffusion_step_embed_dim,
+            dropout=config.p_drop_attn,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,  # important for stability
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer=decoder_layer, num_layers=config.n_layer)
+
+        # attention mask
+        if config.causal_attn:
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            # torch.nn.Transformer uses additive mask as opposed to multiplicative mask in minGPT
+            # therefore, the upper triangle should be -inf and others (including diag) should be 0.
+            sz = config.horizon
+            mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+            mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, float(0.0))
+            self.register_buffer("mask", mask)
+
+            # assume conditioning over time and observation both
+            p, q = torch.meshgrid(torch.arange(config.horizon), torch.arange(t_cond), indexing="ij")
+            mask = p >= (q - 1)  # add one dimension since time is the first token in cond
+            mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, float(0.0))
+            self.register_buffer("memory_mask", mask)
+        else:
+            self.mask = None
+            self.memory_mask = None
+
+        # decoder head
+        self.ln_f = nn.LayerNorm(config.diffusion_step_embed_dim)
+        self.head = nn.Linear(config.diffusion_step_embed_dim, input_dim)
+
+        # constants
+        self.t_cond = t_cond
+        self.horizon = config.horizon
+        self.n_obs_steps = config.n_obs_steps
+
+        # init
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """
+        Initializes weights for different network layers in the module.
+            - nn.Linear and nn.Embedding: Normal(0, 0.02) for weights, zero for bias.
+            - nn.MultiheadAttention: Normal(0, 0.02) for projection weights, zero for biases.
+            - nn.LayerNorm: Ones for weights, zeros for biases.
+            - Normal(0, 0.02) for positional embeddings module.pos_emb.
+            - Predefined layers are ignored.
+        Args:
+            module (torch.nn.Module): The module to initialize.
+        """
+        ignore_types = (
+            nn.Dropout,
+            DiffusionSinusoidalPosEmb,
+            nn.TransformerEncoderLayer,
+            nn.TransformerDecoderLayer,
+            nn.TransformerEncoder,
+            nn.TransformerDecoder,
+            nn.ModuleList,
+            nn.Mish,
+            nn.Sequential,
+        )
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.MultiheadAttention):
+            weight_names = ["in_proj_weight", "q_proj_weight", "k_proj_weight", "v_proj_weight"]
+            for name in weight_names:
+                weight = getattr(module, name)
+                if weight is not None:
+                    torch.nn.init.normal_(weight, mean=0.0, std=0.02)
+
+            bias_names = ["in_proj_bias", "bias_k", "bias_v"]
+            for name in bias_names:
+                bias = getattr(module, name)
+                if bias is not None:
+                    torch.nn.init.zeros_(bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, DiffusionTransformer):
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            if module.cond_obs_emb is not None:
+                torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+        elif isinstance(module, ignore_types):
+            # no param
+            pass
+        else:
+            raise RuntimeError("Unaccounted module {}".format(module))
+
+    def get_optim_groups(self, weight_decay: float = 1e-3):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, _ in m.named_parameters():
+                fpn = "{}.{}".format(mn, pn) if mn else pn  # full param name
+
+                if pn.endswith("bias"):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.startswith("bias"):
+                    # MultiheadAttention bias starts with "bias"
+                    no_decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # special case the position embedding parameter in the root GPT module as not decayed
+        no_decay.add("pos_emb")
+        # no_decay.add("_dummy_variable")
+        if self.cond_pos_emb is not None:
+            no_decay.add("cond_pos_emb")
+
+        # validate that we considered every parameter
+        # param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = dict(self.named_parameters())
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters {} made it into both decay/no_decay sets!".format(
+            str(inter_params)
+        )
+        assert (
+            len(param_dict.keys() - union_params) == 0
+        ), "parameters {} were not separated into either decay/no_decay set!".format(
+            str(param_dict.keys() - union_params),
+        )
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {
+                "params": [param_dict[pn] for pn in sorted(decay)],
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [param_dict[pn] for pn in sorted(no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        return optim_groups
+
+    def configure_optimizers(
+        self,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-3,
+        betas: Tuple[float, float] = (0.9, 0.95),
+    ):
+        optim_groups = self.get_optim_groups(weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+        return optimizer
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, global_cond: torch.Tensor, **kwargs):
+        """
+        Args:
+            x: (B, T, input_dim) tensor for input to the decoder after embedding.
+            t: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            global_cond: (B, global_cond_dim)
+            output: (B, T, input_dim)
+        Returns:
+            (B, T, input_dim) diffusion model prediction.
+        """
+        
+        if t.dim() == 0:
+            # If t is a scalar, we need to unsqueeze it to match the batch size.
+            t = t.unsqueeze(0)
+            t = t.expand(x.shape[0])  # (B,)
+        assert t.dim() == 1, f"Expected t to be a 1D tensor, got {t.dim()}D tensor."
+        # 1. time
+        batch_size = x.shape[0]
+        time_emb = self.time_emb(t).unsqueeze(1)  # (B,1,n_emb)
+        cond = einops.rearrange(
+            global_cond, "b (s n) ... -> b s (n ...)", b=batch_size, s=self.n_obs_steps
+        )  # (B,To,n_cond)
+
+        # process input
+        input_emb = self.input_emb(x)
+        
+        # encoder
+        cond_obs_emb = self.cond_obs_emb(cond)  # (B,To,n_emb)
+        cond_embeddings = torch.cat([time_emb, cond_obs_emb], dim=1)  # (B,To + 1,n_emb)
+
+        position_embeddings = self.cond_pos_emb[
+            :, : cond_embeddings.shape[1], :
+        ]  # each position maps to a (learnable) vector
+        memory = self.drop(cond_embeddings + position_embeddings)
+        memory = self.encoder(memory)  # (B,T_cond,n_emb)
+
+        # decoder
+        position_embeddings = self.pos_emb[
+            :, : input_emb.shape[1], :
+        ]  # each position maps to a (learnable) vector
+        x = self.drop(input_emb + position_embeddings)  # (B,T,n_emb)
+        x = self.decoder(
+            tgt=x, memory=memory, tgt_mask=self.mask, memory_mask=self.memory_mask
+        )  # (B,T,n_emb)
+
+        # head
+        x = self.ln_f(x)
+        x = self.head(x)  # (B,T,n_inp)
+
+        return x
