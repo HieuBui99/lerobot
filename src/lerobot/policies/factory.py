@@ -34,6 +34,7 @@ from lerobot.policies.sac.reward_model.configuration_classifier import RewardCla
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
 from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+from lerobot.policies.flow.configuration_diffusion import DiffusionConfig as FlowConfig
 
 
 def get_policy_class(name: str) -> PreTrainedPolicy:
@@ -74,6 +75,10 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
         return SmolVLAPolicy
+    elif name == "flow":
+        from lerobot.common.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
+
+        return FlowPolicy
     else:
         raise NotImplementedError(f"Policy with name {name} is not implemented.")
 
@@ -97,6 +102,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
+    elif policy_type == "flow":
+        return FlowConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{policy_type}' is not available.")
 

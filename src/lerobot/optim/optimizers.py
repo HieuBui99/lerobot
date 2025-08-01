@@ -151,7 +151,25 @@ class MultiAdamConfig(OptimizerConfig):
 
         return optimizers
 
+@OptimizerConfig.register_subclass("discriminative_lr_adam")
+@dataclass
+class DiscriminativeLRAdamConfig(OptimizerConfig):
+    lr: float = 1e-3
+    betas: tuple[float, float] = (0.9, 0.999)
+    eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 10.0
 
+    def build(self, params: dict) -> torch.optim.Optimizer:
+        parameters = [
+            {"params":[p for p in params["rgb_encoder"] if p.requires_grad], "lr": self.lr * 0.1},
+            {"params":[p for p in params["diffusion"] if p.requires_grad], "lr": self.lr}
+        ]
+        kwargs = asdict(self)
+        kwargs.pop("grad_clip_norm")
+        kwargs.pop("lr")
+        return torch.optim.Adam(parameters, **kwargs)
+    
 def save_optimizer_state(
     optimizer: torch.optim.Optimizer | dict[str, torch.optim.Optimizer], save_dir: Path
 ) -> None:
