@@ -76,7 +76,7 @@ def get_policy_class(name: str) -> PreTrainedPolicy:
 
         return SmolVLAPolicy
     elif name == "flow":
-        from lerobot.common.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
+        from lerobot.policies.flow.modeling_diffusion import DiffusionPolicy as FlowPolicy
 
         return FlowPolicy
     else:
