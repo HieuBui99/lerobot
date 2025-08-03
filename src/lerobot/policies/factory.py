@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import logging
-
+import torch
 from torch import nn
 
 from lerobot.configs.policies import PreTrainedConfig
