@@ -39,16 +39,18 @@ from flow_matching.utils import ModelWrapper
 from torch import Tensor, nn
 from torch.distributions import Beta
 
-from lerobot.common.constants import OBS_ENV_STATE, OBS_STATE
-from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.common.policies.normalize import Normalize, Unnormalize
-from lerobot.common.policies.pretrained import PreTrainedPolicy
-from lerobot.common.policies.utils import (
+from lerobot.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.policies.flow.configuration_diffusion import DiffusionConfig
+from lerobot.policies.normalize import Normalize, Unnormalize
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import (
     get_device_from_parameters,
     get_dtype_from_parameters,
     get_output_shape,
     populate_queues,
 )
+
+from .dit import DiT, SelfAttentionTransformer
 
 
 class CondOTFlowMatchingScheduler():
@@ -69,14 +71,13 @@ class CondOTFlowMatchingScheduler():
         Sample from the flow matching model using the provided velocity model.
         """
 
-        device = get_device_from_parameters(velocity_model)
-        
+        device = get_device_from_parameters(velocity_model)    
         x_init = torch.randn(
             batch_size, velocity_model.config.horizon, velocity_model.config.action_feature.shape[0], 
             dtype=get_dtype_from_parameters(velocity_model), device=device
         )
         time_grid = torch.linspace(0, 1, self.num_inference_steps).to(device=device)
-        
+
         if velocity_model.config.prediction_type == "epsilon":
             wrapper = VelocityModelWrwapper(velocity_model)
             model_extras["path"] = self.path
@@ -85,7 +86,7 @@ class CondOTFlowMatchingScheduler():
         solver = ODESolver(velocity_model=wrapper)
         sol = solver.sample(time_grid=time_grid, x_init=x_init, method='midpoint', step_size=self.ode_step_size, **model_extras)
         return sol
-    
+
     def set_timesteps(self, num_inference_steps: int):
         """
         Set the number of inference steps for the scheduler.
@@ -226,7 +227,19 @@ class DiffusionPolicy(PreTrainedPolicy):
         if self.config.env_state_feature:
             self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
-    @torch.no_grad
+    @torch.no_grad()
+    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+        """Predict a chunk of actions given environment observations."""
+        # stack n latest observations from the queue
+        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        actions = self.diffusion.generate_actions(batch)
+
+        # TODO(rcadene): make above methods return output dictionary?
+        actions = self.unnormalize_outputs({ACTION: actions})[ACTION]
+
+        return actions
+
+    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
@@ -248,26 +261,22 @@ class DiffusionPolicy(PreTrainedPolicy):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        if ACTION in batch:
+            batch.pop(ACTION)
+
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
-        # Note: It's important that this happens after stacking the images into a single key.
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
-        if len(self._queues["action"]) == 0:
-            # stack n latest observations from the queue
-            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            actions = self.diffusion.generate_actions(batch)
+        if len(self._queues[ACTION]) == 0:
+            actions = self.predict_action_chunk(batch)
+            self._queues[ACTION].extend(actions.transpose(0, 1))
 
-            # TODO(rcadene): make above methods return output dictionary?
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-
-            self._queues["action"].extend(actions.transpose(0, 1))
-
-        action = self._queues["action"].popleft()
+        action = self._queues[ACTION].popleft()
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
@@ -275,9 +284,7 @@ class DiffusionPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.config.image_features], dim=-4
-            )
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         batch = self.normalize_targets(batch)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
@@ -324,7 +331,8 @@ class DiffusionModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
 
         if config.use_transformer:
-            self.net = DiffusionTransformer(config, cond_dim=global_cond_dim)
+            # self.net = DiffusionTransformer(config, cond_dim=global_cond_dim)
+            self.net = DiffusionTransformerV2(config, cond_dim=global_cond_dim)
         else:
             self.net = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -1149,7 +1157,7 @@ class DiffusionTransformer(nn.Module):
         Returns:
             (B, T, input_dim) diffusion model prediction.
         """
-        
+
         if t.dim() == 0:
             # If t is a scalar, we need to unsqueeze it to match the batch size.
             t = t.unsqueeze(0)
@@ -1164,7 +1172,7 @@ class DiffusionTransformer(nn.Module):
 
         # process input
         input_emb = self.input_emb(x)
-        
+
         # encoder
         cond_obs_emb = self.cond_obs_emb(cond)  # (B,To,n_emb)
         cond_embeddings = torch.cat([time_emb, cond_obs_emb], dim=1)  # (B,To + 1,n_emb)
@@ -1189,3 +1197,103 @@ class DiffusionTransformer(nn.Module):
         x = self.head(x)  # (B,T,n_inp)
 
         return x
+
+
+class DiffusionTransformerV2(nn.Module):
+    def __init__(self, config: DiffusionConfig, cond_dim: int):
+        super().__init__()
+        self.config = config
+        self.cond_dim = cond_dim
+        self.model = DiT(
+            attention_head_dim=config.attention_head_dim,
+            cross_attention_dim=config.obs_attention_head_dim * config.obs_num_attention_heads,
+            dropout=config.p_drop_attn,
+            final_dropout=config.final_dropout,
+            interleave_self_attention= config.interleave_self_attention,
+            norm_type= config.norm_type,
+            num_attention_heads=config.num_attention_heads,
+            num_layers=config.num_layers,
+            output_dim=config.output_dim,
+            positional_embeddings=None
+        )
+        self.action_encoder = nn.Linear(config.action_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+        self.state_encoder = nn.Linear(config.robot_state_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+        self.ln_f = nn.LayerNorm(config.output_dim)
+        self.head = nn.Linear(config.output_dim, config.action_feature.shape[0])
+
+        # self.obs_encoder = nn.Linear(cond_dim, config.obs_attention_head_dim * config.obs_num_attention_heads)
+        self.obs_encoder = nn.Linear(cond_dim-config.robot_state_feature.shape[0], config.obs_attention_head_dim * config.obs_num_attention_heads)
+        self.obs_ln = nn.LayerNorm(config.obs_attention_head_dim * config.obs_num_attention_heads)
+        self.obs_attention = SelfAttentionTransformer(
+            attention_head_dim=config.obs_attention_head_dim,
+            dropout=config.p_drop_attn,
+            final_dropout=config.final_dropout,
+            num_attention_heads=config.obs_num_attention_heads,
+            num_layers = config.obs_num_layers,
+            positional_embeddings="sinusoidal",
+        )
+
+        self.positional_embeddings = nn.Embedding(64, config.attention_head_dim * config.num_attention_heads)
+        nn.init.normal_(self.positional_embeddings.weight, mean=0.0, std=0.02)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, global_cond: torch.Tensor, **kwargs):
+        """
+        Args:
+            x: (B, T, input_dim) tensor for input to the decoder after embedding.
+            t: (B,) tensor of (timestep_we_are_denoising_from - 1).
+            global_cond: (B, global_cond_dim)
+            output: (B, T, input_dim)
+        Returns:
+            (B, T, input_dim) diffusion model prediction.
+        """
+
+        if t.dim() == 0:
+            # If t is a scalar, we need to unsqueeze it to match the batch size.
+            t = t.unsqueeze(0)
+            t = t.expand(x.shape[0])  # (B,)
+
+        # t = t[:, None, None]  # (B, 1, 1)
+        # assert t.dim() == 3, f"Expected t to be a 3D tensor, got {t.dim()}D tensor."
+
+        cond = einops.rearrange(
+            global_cond, "b (s n) ... -> b s (n ...)", b=x.shape[0], s=self.config.n_obs_steps
+        ) # (B,To,n_cond)
+
+        # split condition into states and observations in the last dimension
+        states, obs = torch.split(
+            cond,
+            [self.config.robot_state_feature.shape[0], self.cond_dim - self.config.robot_state_feature.shape[0]],
+            dim=-1
+        )
+        # process observations
+        obs = self.obs_encoder(obs)  # (B, To, n_emb)
+        obs = self.obs_ln(obs)
+        obs = self.obs_attention(obs) # (B, To, n_emb)
+
+        # process observations
+        # cond = self.obs_encoder(cond)  # (B, To, n_emb)
+        # cond = self.obs_ln(cond)
+        # cond = self.obs_attention(cond) # (B, To, n_emb)
+
+        # project action features to transformer input dimension
+        x = self.action_encoder(x)  # (B, T, n_emb)
+        pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
+        pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)  # (1, T, n_emb)
+        x = x + pos_embs  # (B, T, n_emb)
+
+        states = self.state_encoder(states)  # (B, To, n_emb)
+        sa_embs = torch.cat([states, x], dim=1)  # (B, T + To, n_emb)
+
+        encoder_attention_mask = torch.ones(obs.shape[1], dtype=torch.bool, device=x.device)  # (To,)
+        sa_embs = self.model(
+            hidden_states=sa_embs,
+            encoder_hidden_states=obs,
+            encoder_attention_mask=encoder_attention_mask,
+            timestep=t,
+            return_all_hidden_states=False,
+        )
+
+        pred = self.ln_f(sa_embs)  # (B, T, n_emb)
+        pred = self.head(pred)  # (B, T, n_inp)
+
+        return pred[:, -x.shape[1]:, :]  # return only the last T timesteps corresponding to the input x
