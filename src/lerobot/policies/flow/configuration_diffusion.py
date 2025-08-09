@@ -150,6 +150,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
+    tikhonov_weight: float = 0.0
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -160,13 +161,29 @@ class DiffusionConfig(PreTrainedConfig):
     scheduler_warmup_steps: int = 1000
 
     #transformer hyperparameters
-    use_transformer: bool = True
-    n_layer: int = 8
-    n_head: int = 4
-    p_drop_emb: float = 0.0
-    p_drop_attn: float = 0.3
-    causal_attn: bool = True
-    n_cond_layers: int = 0
+    # use_transformer: bool = True
+    # n_layer: int = 8
+    # n_head: int = 4
+    # p_drop_emb: float = 0.0
+    # p_drop_attn: float = 0.3
+    # causal_attn: bool = True
+    # n_cond_layers: int = 0
+
+    # DiT hyperparameters
+    use_transformer: bool = False
+    attention_head_dim: int = 64
+    num_attention_heads: int = 16
+    num_layers: int = 8
+    p_drop_attn: float = 0.2
+    final_dropout: bool = True
+    norm_type: str = "ada_norm"
+    output_dim: int = 1024
+    interleave_self_attention: bool = True
+
+    obs_attention_head_dim: int = 64
+    obs_num_attention_heads: int = 16
+    obs_num_layers: int = 4
+
 
     # flow matching huperparameters
     ode_step_size: float | None = None
