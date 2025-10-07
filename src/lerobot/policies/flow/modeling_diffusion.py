@@ -49,8 +49,69 @@ from lerobot.policies.utils import (
     get_output_shape,
     populate_queues,
 )
-
+from diffusers.models.embeddings import SinusoidalPositionalEmbedding
 from .dit import DiT, SelfAttentionTransformer
+
+
+def resize_with_pad(img, height, width, pad_value=-1):
+    """
+    Resizes an image to a target height and width while maintaining aspect ratio,
+    and pads the image to the target dimensions with even padding on all sides.
+
+    Args:
+        img (torch.Tensor): Input image tensor. Expected shape is (B, C, H, W) or (B, N, C, H, W).
+        height (int): Target height.
+        width (int): Target width.
+        pad_value (int, optional): Value to use for padding. Defaults to -1.
+
+    Returns:
+        torch.Tensor: The resized and padded image tensor.
+    """
+    n = None
+    if img.ndim == 5:
+        # B x N x C x H x W -> (B*N) x C x H x W
+        _, n, _, _, _ = img.shape
+        img = einops.rearrange(img, "b n c h w -> (b n) c h w")
+
+    if img.ndim != 4:
+        raise ValueError(f"Expected a 4D tensor (B, C, H, W), but got {img.shape}")
+
+    cur_height, cur_width = img.shape[2:]
+
+    # Do nothing if the image already fits the target dimensions
+    if cur_height == height and cur_width == width:
+        if n is not None:
+            img = einops.rearrange(img, "(b n) c h w -> b n c h w", n=n)
+        return img
+
+    # Calculate the ratio to resize the image
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+
+    # Resize the image using bilinear interpolation
+    resized_img = F.interpolate(
+        img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
+    )
+
+    # Calculate the total padding needed
+    pad_height = max(0, height - resized_height)
+    pad_width = max(0, width - resized_width)
+
+    # Calculate padding for each side to be even
+    pad_top = pad_height // 2
+    pad_bottom = pad_height - pad_top  # Handles odd padding
+    pad_left = pad_width // 2
+    pad_right = pad_width - pad_left   # Handles odd padding
+
+    # Apply the padding. The padding tuple is (left, right, top, bottom).
+    padded_img = F.pad(resized_img, (pad_left, pad_right, pad_top, pad_bottom), value=pad_value)
+
+    # Reshape back to 5D if necessary
+    if n is not None:
+        padded_img = einops.rearrange(padded_img, "(b n) c h w -> b n c h w", n=n)
+
+    return padded_img
 
 
 class CondOTFlowMatchingScheduler():
@@ -268,6 +329,14 @@ class DiffusionPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            if self.config.do_resize:
+                for key in self.config.image_features:
+                    if key in batch:
+                        batch[key] = resize_with_pad(batch[key], *self.config.resize_shape, pad_value=0)
+                    if self.config.n_obs_steps == 1:
+                        batch[key] = batch[key].unsqueeze(1)
+            # randomly mask out the wrist camera during training for better generalization
+
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
@@ -284,6 +353,12 @@ class DiffusionPolicy(PreTrainedPolicy):
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            if self.config.do_resize:
+                for key in self.config.image_features:
+                    if key in batch:
+                        batch[key] = resize_with_pad(batch[key], *self.config.resize_shape, pad_value=0)
+                    if self.config.n_obs_steps == 1:
+                        batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         batch = self.normalize_targets(batch)
         loss = self.diffusion.compute_loss(batch)
@@ -532,6 +607,9 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
+        if self.config.tikhonov_weight:
+            pred = einops.rearrange(pred, 'b t c -> b (t c)')
+            loss =  loss.mean(dim=(1, 2)) + self.config.tikhonov_weight * torch.mean(pred**2, dim=(1))
         return loss.mean()
 
 
@@ -652,7 +730,11 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        # dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        if config.do_resize:
+            dummy_shape_h_w = config.resize_shape
+        if config.crop_shape is not None:
+            dummy_shape_h_w = config.crop_shape
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
@@ -1199,6 +1281,84 @@ class DiffusionTransformer(nn.Module):
         return x
 
 
+def swish(x):
+    return x * torch.sigmoid(x)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Produces a sinusoidal encoding of shape (B, T, w)
+    given timesteps of shape (B, T).
+    """
+
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps):
+        # timesteps: shape (B, T)
+        # We'll compute sin/cos frequencies across dim T
+        timesteps = timesteps.float()  # ensure float
+
+        B, T = timesteps.shape
+        device = timesteps.device
+
+        half_dim = self.embedding_dim // 2
+        # typical log space frequencies for sinusoidal encoding
+        exponent = -torch.arange(half_dim, dtype=torch.float, device=device) * (
+            torch.log(torch.tensor(10000.0)) / half_dim
+        )
+        # Expand timesteps to (B, T, 1) then multiply
+        freqs = timesteps.unsqueeze(-1) * exponent.exp()  # (B, T, half_dim)
+
+        sin = torch.sin(freqs)
+        cos = torch.cos(freqs)
+        enc = torch.cat([sin, cos], dim=-1)  # (B, T, w)
+
+        return enc
+
+
+class StateEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.pos_emb = SinusoidalPositionalEmbedding(hidden_dim, max_seq_length=512)
+        print(input_dim)
+
+    def forward(self, x: torch.Tensor):
+        # x: (b, t, c)
+        x = self.fc1(x)
+        x = self.pos_emb(x)  # Apply positional embedding
+        x = torch.relu(x)
+        x = self.fc2(x)
+        return x
+
+
+class ActionEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(2 * hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        self.pos_enc = SinusoidalPositionalEncoding(hidden_dim)
+
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor):
+        # x: (b, t, c); t: (b, )
+        B, T, _ = x.shape
+        timesteps = timesteps.unsqueeze(1).expand(-1, T) # (B, T)
+
+        #get sinusoidal encoding
+        pos_enc = self.pos_enc(timesteps).to(x.dtype)
+        x = self.fc1(x)  # (B, T, hidden_dim)
+        x = torch.cat([x, pos_enc], dim=-1)  # (B, T, 2 * hidden_dim)
+        x = self.fc2(x)
+        x = swish(x)  # Apply Swish activation
+        x = self.fc3(x)
+
+        return x
+
+
 class DiffusionTransformerV2(nn.Module):
     def __init__(self, config: DiffusionConfig, cond_dim: int):
         super().__init__()
@@ -1216,13 +1376,33 @@ class DiffusionTransformerV2(nn.Module):
             output_dim=config.output_dim,
             positional_embeddings=None
         )
-        self.action_encoder = nn.Linear(config.action_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
-        self.state_encoder = nn.Linear(config.robot_state_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+        # self.action_encoder = nn.Linear(config.action_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+        # self.state_encoder = nn.Linear(config.robot_state_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+        self.action_encoder = ActionEncoder(
+            input_dim=config.action_feature.shape[0],
+            hidden_dim=config.attention_head_dim * config.num_attention_heads,
+            output_dim=config.attention_head_dim * config.num_attention_heads
+        )
+        if self.config.n_obs_steps == 1:
+            self.state_encoder = StateEncoder(
+                input_dim=config.robot_state_feature.shape[0],
+                hidden_dim=config.obs_attention_head_dim * config.obs_num_attention_heads,
+                output_dim=config.obs_attention_head_dim * config.obs_num_attention_heads
+            )
+        else:
+            self.state_encoder = StateEncoder(
+                input_dim=config.robot_state_feature.shape[0],
+                hidden_dim=config.attention_head_dim * config.num_attention_heads,
+                output_dim=config.attention_head_dim * config.num_attention_heads
+            )
         self.ln_f = nn.LayerNorm(config.output_dim)
         self.head = nn.Linear(config.output_dim, config.action_feature.shape[0])
 
         # self.obs_encoder = nn.Linear(cond_dim, config.obs_attention_head_dim * config.obs_num_attention_heads)
-        self.obs_encoder = nn.Linear(cond_dim-config.robot_state_feature.shape[0], config.obs_attention_head_dim * config.obs_num_attention_heads)
+        if self.config.n_obs_steps == 1:
+            self.obs_encoder = nn.Linear((cond_dim-config.robot_state_feature.shape[0]) // len(self.config.image_features), config.obs_attention_head_dim * config.obs_num_attention_heads)
+        else:
+            self.obs_encoder = nn.Linear(cond_dim-config.robot_state_feature.shape[0], config.obs_attention_head_dim * config.obs_num_attention_heads)
         self.obs_ln = nn.LayerNorm(config.obs_attention_head_dim * config.obs_num_attention_heads)
         self.obs_attention = SelfAttentionTransformer(
             attention_head_dim=config.obs_attention_head_dim,
@@ -1235,6 +1415,10 @@ class DiffusionTransformerV2(nn.Module):
 
         self.positional_embeddings = nn.Embedding(64, config.attention_head_dim * config.num_attention_heads)
         nn.init.normal_(self.positional_embeddings.weight, mean=0.0, std=0.02)
+
+        if self.config.use_future_embedding:
+            self.future_embeddings = nn.Embedding(config.num_future_embeddings, config.attention_head_dim * config.num_attention_heads)
+            nn.init.normal_(self.future_embeddings.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, global_cond: torch.Tensor, **kwargs):
         """
@@ -1265,35 +1449,90 @@ class DiffusionTransformerV2(nn.Module):
             [self.config.robot_state_feature.shape[0], self.cond_dim - self.config.robot_state_feature.shape[0]],
             dim=-1
         )
+        if self.config.n_obs_steps == 1:
+            obs = einops.rearrange(obs.squeeze(1), "b (n c) -> b n c", n=len(self.config.image_features), b=x.shape[0])  # (B, n_obs, obs_dim)
+            obs = self.obs_encoder(obs)  # (B, n_obs, n_emb)
+
+            states = self.state_encoder(states)  # (B, 1, n_emb)
+            obs = torch.cat([states, obs], dim=1)  # (B, To, n_emb)
+
+            obs = self.obs_ln(obs)
+            obs = self.obs_attention(obs) # (B, To, n_emb)
+
+            # project action features to transformer input dimension
+            x = self.action_encoder(x, t)  # (B, T, n_emb)
+            pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
+            pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)
+            x = x + pos_embs  # (B, T, n_emb)
+            sa_embs = x
+
+            encoder_attention_mask = torch.ones(cond.shape[1], dtype=torch.bool, device=x.device)  # (To,)
+
+            if self.config.use_future_embedding:
+                sa_embs, hidden_states = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=obs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=t,
+                    return_all_hidden_states=True,
+                )
+            else:
+                sa_embs = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=obs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=t,
+                    return_all_hidden_states=False,
+                )
+            pred = self.ln_f(sa_embs)  # (B, T, n_emb)
+            pred = self.head(pred)  # (B, T, n_inp)
+            return pred
+        else:
         # process observations
-        obs = self.obs_encoder(obs)  # (B, To, n_emb)
-        obs = self.obs_ln(obs)
-        obs = self.obs_attention(obs) # (B, To, n_emb)
+            obs = self.obs_encoder(obs)  # (B, To, n_emb)
+            obs = self.obs_ln(obs)
+            obs = self.obs_attention(obs) # (B, To, n_emb)
 
-        # process observations
-        # cond = self.obs_encoder(cond)  # (B, To, n_emb)
-        # cond = self.obs_ln(cond)
-        # cond = self.obs_attention(cond) # (B, To, n_emb)
+            # process observations
+            # cond = self.obs_encoder(cond)  # (B, To, n_emb)
+            # cond = self.obs_ln(cond)
+            # cond = self.obs_attention(cond) # (B, To, n_emb)
 
-        # project action features to transformer input dimension
-        x = self.action_encoder(x)  # (B, T, n_emb)
-        pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
-        pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)  # (1, T, n_emb)
-        x = x + pos_embs  # (B, T, n_emb)
+            # project action features to transformer input dimension
+            x = self.action_encoder(x, t)  # (B, T, n_emb)
+            pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
+            pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)  # (1, T, n_emb)
+            x = x + pos_embs  # (B, T, n_emb)
 
-        states = self.state_encoder(states)  # (B, To, n_emb)
-        sa_embs = torch.cat([states, x], dim=1)  # (B, T + To, n_emb)
+            states = self.state_encoder(states)  # (B, To, n_emb)
 
-        encoder_attention_mask = torch.ones(obs.shape[1], dtype=torch.bool, device=x.device)  # (To,)
-        sa_embs = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=obs,
-            encoder_attention_mask=encoder_attention_mask,
-            timestep=t,
-            return_all_hidden_states=False,
-        )
+            if self.config.use_future_embedding:
+                future_embeddings = self.future_embeddings.weight.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, n_future, n_emb)
+                sa_embs = torch.cat([states, x, future_embeddings], dim=1)  # (B, T + To + n_future, n_emb)
+            else:
+                sa_embs = torch.cat([states, x], dim=1)  # (B, T + To, n_emb)
+            # sa_embs = x
+            encoder_attention_mask = torch.ones(cond.shape[1], dtype=torch.bool, device=x.device)  # (To,)
 
-        pred = self.ln_f(sa_embs)  # (B, T, n_emb)
-        pred = self.head(pred)  # (B, T, n_inp)
+            if self.config.use_future_embedding:
+                sa_embs, hidden_states = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=obs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=t,
+                    return_all_hidden_states=True,
+                )
+            else:
+                sa_embs = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=obs,
+                    encoder_attention_mask=encoder_attention_mask,
+                    timestep=t,
+                    return_all_hidden_states=False,
+                )
 
-        return pred[:, -x.shape[1]:, :]  # return only the last T timesteps corresponding to the input x
+            pred = self.ln_f(sa_embs)  # (B, T, n_emb)
+            pred = self.head(pred)  # (B, T, n_inp)
+
+            return pred[:, -x.shape[1]:, :]  # return only the last T timesteps corresponding to the input x
+            # return pred

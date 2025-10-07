@@ -123,12 +123,16 @@ class DiffusionConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    crop_shape: tuple[int, int] | None = (84, 84)
+    # crop_shape: tuple[int, int] | None = (84, 84)
+    crop_shape: tuple[int, int] | None = None
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    do_resize: bool = False
+    resize_shape: tuple[int, int] | None = (240, 320)
+
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -150,7 +154,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
-    tikhonov_weight: float = 0.0
+    tikhonov_weight: float | None = None
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -174,7 +178,7 @@ class DiffusionConfig(PreTrainedConfig):
     attention_head_dim: int = 64
     num_attention_heads: int = 16
     num_layers: int = 8
-    p_drop_attn: float = 0.2
+    p_drop_attn: float = 0.3
     final_dropout: bool = True
     norm_type: str = "ada_norm"
     output_dim: int = 1024
@@ -184,6 +188,9 @@ class DiffusionConfig(PreTrainedConfig):
     obs_num_attention_heads: int = 16
     obs_num_layers: int = 4
 
+    #future embedding
+    use_future_embedding: bool = False
+    num_future_embeddings: int = 32
 
     # flow matching huperparameters
     ode_step_size: float | None = None

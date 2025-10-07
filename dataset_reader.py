@@ -57,8 +57,8 @@ class EpisodeReader:
 
         # Find the frame indices that belong to this episode
         if hasattr(self.dataset, "episode_data_index") and self.dataset.episode_data_index is not None:
-            episode_start = self.dataset.episode_data_index["from"][self.episode_index].item()
-            episode_end = self.dataset.episode_data_index["to"][self.episode_index].item()
+            episode_start = self.dataset.episode_data_index["from"][0].item()
+            episode_end = self.dataset.episode_data_index["to"][0].item()
             self.frame_indices = list(range(episode_start, episode_end))
         else:
             # Fallback: scan through the dataset to find frames for this episode
@@ -284,7 +284,7 @@ class EpisodeReader:
 
 if __name__ == "__main__":
     # Example usage EpisodeReader(dataset_name, episode_index)
-    episode_reader = EpisodeReader("hieu1344/omy_baseline", 0)
+    episode_reader = EpisodeReader("hieu1344/omy_baseline", 1)
     print(f"Episode length: {len(episode_reader)} frames")
 
     # # Get all observations (follower joint angles)
