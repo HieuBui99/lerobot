@@ -177,7 +177,7 @@ class TruncatedFlowMatchingScheduler():
         self.num_timestep_buckets = num_train_timesteps
         self.noise_s = noise_s
         self.beta_dist = Beta(noise_beta_alpha, noise_beta_beta)
-
+        self.cfg_scale = 5.0
     def sample_time(self, bs, device, dtype):
         sample = self.beta_dist.sample((bs, )).to(device=device, dtype=dtype)
         return (self.noise_s - sample) / self.noise_s
@@ -195,9 +195,9 @@ class TruncatedFlowMatchingScheduler():
         """
         Set the number of inference steps for the scheduler.
         """
-        self.num_inference_steps = 10
+        self.num_inference_steps = 5
 
-    def sample(self, velocity_model: nn.Module, batch_size: int, global_cond: Tensor) -> Tensor:
+    def sample(self, velocity_model: nn.Module, batch_size: int, global_cond: Tensor, goal: Tensor | None = None) -> Tensor:
         """
         Sample from the flow matching model using the provided velocity model.
         """
@@ -216,11 +216,51 @@ class TruncatedFlowMatchingScheduler():
             t_tensor = torch.full((batch_size, ), t_discrete, dtype=torch.long, device=device)
 
             # Predict model output.
-            model_output = velocity_model(actions, t_tensor, global_cond=global_cond)
+            model_output = velocity_model(actions, t_tensor, global_cond=global_cond, goal=goal if goal is not None else None)
 
             actions = actions + dt * model_output
         return actions
 
+    def sample_cfg(self, velocity_model: nn.Module, batch_size: int, global_cond: Tensor, goal: Tensor | None = None, task_id: Tensor | None = None) -> Tensor:
+        """
+        Sample with classifier-free guidance from the flow matching model using the provided velocity model.
+        """
+        device = get_device_from_parameters(velocity_model)
+
+        actions = torch.randn(
+            batch_size, velocity_model.config.horizon, velocity_model.config.action_feature.shape[0],
+            dtype=get_dtype_from_parameters(velocity_model), device=device
+        )
+        null_goal = torch.zeros_like(goal)
+        goals = torch.cat([goal, null_goal], dim=0)
+        # goals = torch.cat([goal, goal], dim=0)
+        # goal_flags = torch.cat([torch.ones((batch_size, 1), device=device), torch.zeros((batch_size, 1), device=device)], dim=0)
+        # goals = torch.cat([goals, goal_flags], dim=-1)
+        global_cond = torch.cat([global_cond, global_cond], dim=0)
+        if task_id is not None:
+            null_task_id = torch.tensor([3]).to(device)
+            task_id = torch.cat([task_id, null_task_id], dim=0)
+        dt = 1.0 / self.num_inference_steps
+        for t in range(self.num_inference_steps):
+            if t <= 2:
+                scale = self.cfg_scale
+            else:
+                scale = self.cfg_scale
+            model_input = torch.cat([actions, actions], dim=0)
+
+            t_cont = t / float(self.num_inference_steps)
+            t_discrete = int(t_cont * self.num_timestep_buckets)
+
+            t_tensor = torch.full((batch_size * 2, ), t_discrete, dtype=torch.long, device=device)
+
+            # Predict model output.
+            model_output = velocity_model(model_input, t_tensor, global_cond=global_cond, goal=goals, task_id=task_id if task_id is not None else None)
+            cond, uncond = model_output.chunk(2, dim=0)
+
+            model_output = uncond + scale * (cond - uncond)
+            actions = actions + dt * model_output
+
+        return actions
 
 class DiffusionPolicy(PreTrainedPolicy):
     """
@@ -292,7 +332,15 @@ class DiffusionPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         # stack n latest observations from the queue
+        if self.config.use_goal_conditioning:
+            goal = batch['object_poses']
+            task_id = batch['task_index']
         batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+
+        if self.config.use_goal_conditioning:
+            batch['object_poses'] = goal
+            batch['task_index'] = task_id
+
         actions = self.diffusion.generate_actions(batch)
 
         # TODO(rcadene): make above methods return output dictionary?
@@ -335,8 +383,39 @@ class DiffusionPolicy(PreTrainedPolicy):
                         batch[key] = resize_with_pad(batch[key], *self.config.resize_shape, pad_value=0)
                     if self.config.n_obs_steps == 1:
                         batch[key] = batch[key].unsqueeze(1)
-            # randomly mask out the wrist camera during training for better generalization
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        # NOTE: It's important that this happens after stacking the images into a single key.
+        self._queues = populate_queues(self._queues, batch)
 
+        if len(self._queues[ACTION]) == 0:
+            actions = self.predict_action_chunk(batch)
+            self._queues[ACTION].extend(actions.transpose(0, 1))
+
+        action = self._queues[ACTION].popleft()
+        return action
+
+    @torch.no_grad()
+    def select_action_conditional(self, batch: dict[str, Tensor]) -> Tensor:
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        if ACTION in batch:
+            batch.pop(ACTION)
+
+        batch = self.normalize_inputs(batch)
+
+        if self.config.use_goal_conditioning:
+            batch['object_poses'] = batch['object_poses'][:, 0][:, :self.config.goal_dim]
+            # batch['object_poses'] = batch['mask'] # get the first two channels as the goal
+            # batch['object_poses'] = resize_with_pad(batch['object_poses'], *self.config.resize_shape, pad_value=0)
+            # batch['object_poses'] = (batch['object_poses'] > 0.5).float()
+
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            if self.config.do_resize:
+                for key in self.config.image_features:
+                    if key in batch:
+                        batch[key] = resize_with_pad(batch[key], *self.config.resize_shape, pad_value=0)
+                    if self.config.n_obs_steps == 1:
+                        batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
@@ -351,6 +430,7 @@ class DiffusionPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         batch = self.normalize_inputs(batch)
+        
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             if self.config.do_resize:
@@ -432,7 +512,7 @@ class DiffusionModel(nn.Module):
 
     # ========= inference  ============
     def conditional_sample(
-        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None
+        self, batch_size: int, global_cond: Tensor | None = None, generator: torch.Generator | None = None, goal: Tensor | None = None, task_id: Tensor | None = None
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -450,18 +530,46 @@ class DiffusionModel(nn.Module):
         if self.config.noise_scheduler_type != "flow":
             for t in self.noise_scheduler.timesteps:
                 # Predict model output.
-                model_output = self.net(
-                    sample,
-                    torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                    global_cond=global_cond,
-                )
+                if self.config.use_goal_conditioning:
+                    if self.config.use_cfg:
+                        null_goal = torch.zeros_like(goal)
+                        goals = torch.cat([goal, null_goal], dim=0)
+                        global_cond_input = torch.cat([global_cond, global_cond], dim=0)
+                        model_input = torch.cat([sample, sample], dim=0)
+                        t_input = torch.full((batch_size * 2,), t, dtype=torch.long, device=sample.device)
+                        model_output = self.net(
+                            model_input,
+                            t_input,
+                            global_cond=global_cond_input,
+                            goal=goals
+                        )
+                        cond, uncond = model_output.chunk(2, dim=0)
+                        scale = 15.0
+                        model_output = uncond + scale * (cond - uncond)
+                    else:
+                        model_output = self.net(
+                            sample,
+                            torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                            global_cond=global_cond,
+                            goal=goal
+                        )
+                else:
+                    model_output = self.net(
+                        sample,
+                        torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                        global_cond=global_cond,
+                    )
                 # Compute previous image: x_t -> x_t-1
                 sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
         else:
             # Flow matching scheduler.
             # model_extras = {"global_cond": global_cond} if global_cond is not None else {}
             # sample = self.noise_scheduler.sample(self.net, batch_size, generator=generator, **model_extras)
-            sample = self.noise_scheduler.sample(self.net, batch_size, global_cond=global_cond)
+            if self.config.use_goal_conditioning:
+                # sample = self.noise_scheduler.sample(self.net, batch_size, global_cond=global_cond, goal=goal)
+                sample = self.noise_scheduler.sample_cfg(self.net, batch_size, global_cond=global_cond, goal=goal, task_id=task_id)
+            else:
+                sample = self.noise_scheduler.sample(self.net, batch_size, global_cond=global_cond)
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
@@ -520,7 +628,11 @@ class DiffusionModel(nn.Module):
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+        if self.config.use_goal_conditioning:
+            task_id = batch['task_index'] if self.config.use_task_specific_encoder else None
+            actions = self.conditional_sample(batch_size, global_cond=global_cond, goal=batch['object_poses'], task_id=task_id)
+        else:
+            actions = self.conditional_sample(batch_size, global_cond=global_cond)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -1358,6 +1470,126 @@ class ActionEncoder(nn.Module):
 
         return x
 
+class TaskSpecificLinear(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_categories: int = 3):
+        super().__init__()
+        self.num_categories = num_categories
+        # For each task, we have separate weights and biases.
+        self.W = nn.Parameter(0.02 * torch.randn(num_categories, input_dim, hidden_dim))
+        self.b = nn.Parameter(torch.zeros(num_categories, hidden_dim))
+
+    def forward(self, x, task_ids):
+        selected_W = self.W[task_ids]  # (batch_size, input_dim, hidden_dim)
+        selected_b = self.b[task_ids]  # (batch_size, hidden_dim)
+        return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
+
+class TaskSpecificActionEncoder(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, n_tasks: int = 3):
+        super().__init__()
+        self.fc1 = TaskSpecificLinear(input_dim, hidden_dim, num_categories=n_tasks)
+        self.fc2 = TaskSpecificLinear(2 * hidden_dim, hidden_dim, num_categories=n_tasks)
+        self.fc3 = TaskSpecificLinear(hidden_dim, output_dim, num_categories=n_tasks)
+        self.pos_enc = SinusoidalPositionalEncoding(hidden_dim)
+
+
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor, task_id: torch.Tensor):
+        # Get positional encoding
+        B, T, _ = x.shape
+        timesteps = timesteps.unsqueeze(1).expand(-1, T) # (B, T)
+        pos_enc = self.pos_enc(timesteps).to(x.dtype)
+        x = self.fc1(x, task_id)  # (B, T, hidden_dim)
+        x = torch.cat([x, pos_enc], dim=-1)  # (B, T, 2 * hidden_dim)
+        x = self.fc2(x, task_id)
+        x = swish(x)  # Apply Swish activation
+        x = self.fc3(x, task_id)
+
+        return x
+    
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, output_dim)
+        self.fc2 = nn.Linear(input_dim, output_dim)
+        self.fc3 = nn.Linear(output_dim, input_dim)
+
+    def forward(self, x):
+        x_fc1 = self.fc1(x)
+        x_fc2 = self.fc2(x)
+        x = swish(x_fc1) * x_fc2
+        return self.fc3(x)
+
+class ConditionEmbedder(nn.Module):
+    def __init__(self, n_tasks: int, goal_dim: int, embed_dim: int):
+        """
+        Encode the goal and task ID into a condition embedding.
+        """
+        super().__init__()
+        # target encoder
+        self.target_enc = nn.Linear(goal_dim//2, embed_dim)
+        self.target_ln = nn.LayerNorm(embed_dim)
+        self.target_mlp = MLP(embed_dim, embed_dim*2)
+
+        # goal encoder
+        self.goal_enc = nn.Linear(goal_dim//2 + n_tasks + 1, embed_dim)
+        self.goal_ln = nn.LayerNorm(embed_dim)
+        self.goal_mlp = MLP(embed_dim, embed_dim*2)
+
+
+    def forward(self, goal: torch.Tensor, task_onehot: torch.Tensor):
+        """
+        Args:
+            goal: (B, goal_dim) tensor representing the goal.
+            task_onehot: (B, n_tasks+1) one-hot encoded tensor representing the task ID
+        Returns:
+            (B, embed_dim) condition embedding.
+        """
+        target_pixel, goal_pixel = torch.split(goal, goal.shape[-1]//2, dim=-1) # (B, goal_dim//2)
+
+        # concat goal_pixel with task_onehot
+        goal_emb = torch.cat([goal_pixel, task_onehot], dim=-1)  # (B, goal_dim//2 + n_tasks + 1)
+
+        target_emb = self.target_enc(target_pixel)  # (B, output_dim)
+        target_emb = self.target_ln(swish(target_emb))
+        target_emb = self.target_mlp(target_emb)
+
+        goal_emb = self.goal_enc(goal_emb)  # (B, output_dim)
+        goal_emb = self.goal_ln(swish(goal_emb))
+        goal_emb = self.goal_mlp(goal_emb)
+
+        cond_emb = goal_emb + target_emb  # (B, embed_dim)
+        return cond_emb
+
+
+class GoalEncoder(nn.Module):
+    def __init__(self, goal_dim: int, output_dim: int):
+        """
+        Encode the goal
+        """
+        super().__init__()
+
+
+        self.goal_embedding = nn.Linear(goal_dim//2, output_dim//2, bias=False)
+        # positional embedding
+        self.pe = SinusoidalPositionalEmbedding(output_dim//2, max_seq_length=2) # encoder the x and y position of the pixel
+
+        # encoder
+        self.mlp = MLP(output_dim//2, output_dim)
+
+
+    def forward(self, goal: torch.Tensor):
+        """
+        Args:
+            goal: (B, goal_dim) tensor representing the goal.
+        Returns:
+            (B, embed_dim) condition embedding.
+        """
+        goal = goal.view(goal.shape[0], 2, -1)  # (B, 2, goal_dim//2)
+        goal = self.goal_embedding(goal)  # (B, 2, output_dim)
+        goal_emb = self.pe(goal)  # (B, 2, output_dim)
+
+        goal_emb = self.mlp(goal_emb) # (B, 2, output_dim)
+        goal_emb = goal_emb.view(goal_emb.shape[0], -1)  # (B, embed_dim)
+        return goal_emb
 
 class DiffusionTransformerV2(nn.Module):
     def __init__(self, config: DiffusionConfig, cond_dim: int):
@@ -1378,31 +1610,33 @@ class DiffusionTransformerV2(nn.Module):
         )
         # self.action_encoder = nn.Linear(config.action_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
         # self.state_encoder = nn.Linear(config.robot_state_feature.shape[0], config.attention_head_dim*config.num_attention_heads)
+
         self.action_encoder = ActionEncoder(
             input_dim=config.action_feature.shape[0],
             hidden_dim=config.attention_head_dim * config.num_attention_heads,
             output_dim=config.attention_head_dim * config.num_attention_heads
         )
-        if self.config.n_obs_steps == 1:
-            self.state_encoder = StateEncoder(
-                input_dim=config.robot_state_feature.shape[0],
-                hidden_dim=config.obs_attention_head_dim * config.obs_num_attention_heads,
-                output_dim=config.obs_attention_head_dim * config.obs_num_attention_heads
-            )
-        else:
-            self.state_encoder = StateEncoder(
-                input_dim=config.robot_state_feature.shape[0],
-                hidden_dim=config.attention_head_dim * config.num_attention_heads,
-                output_dim=config.attention_head_dim * config.num_attention_heads
-            )
         self.ln_f = nn.LayerNorm(config.output_dim)
+        # if not self.config.use_task_specific_encoder:
         self.head = nn.Linear(config.output_dim, config.action_feature.shape[0])
+        # else:
+        #     self.head = TaskSpecificActionEncoder(
+        #         input_dim=config.output_dim,
+        #         hidden_dim=config.output_dim,
+        #         output_dim=config.action_feature.shape[0],
+        #         # n_tasks=self.config.n_tasks
+        #     )
 
         # self.obs_encoder = nn.Linear(cond_dim, config.obs_attention_head_dim * config.obs_num_attention_heads)
         if self.config.n_obs_steps == 1:
             self.obs_encoder = nn.Linear((cond_dim-config.robot_state_feature.shape[0]) // len(self.config.image_features), config.obs_attention_head_dim * config.obs_num_attention_heads)
         else:
-            self.obs_encoder = nn.Linear(cond_dim-config.robot_state_feature.shape[0], config.obs_attention_head_dim * config.obs_num_attention_heads)
+            # self.obs_encoder = nn.Linear(cond_dim-config.robot_state_feature.shape[0], config.obs_attention_head_dim * config.obs_num_attention_heads)
+            if self.config.use_goal_conditioning:
+                # self.obs_encoder = nn.Linear(cond_dim, config.obs_attention_head_dim * config.obs_num_attention_heads)
+                self.obs_encoder = nn.Linear(cond_dim+config.goal_dim+config.n_tasks+1, config.obs_attention_head_dim * config.obs_num_attention_heads)
+            else:
+                self.obs_encoder = nn.Linear(cond_dim, config.obs_attention_head_dim * config.obs_num_attention_heads)
         self.obs_ln = nn.LayerNorm(config.obs_attention_head_dim * config.obs_num_attention_heads)
         self.obs_attention = SelfAttentionTransformer(
             attention_head_dim=config.obs_attention_head_dim,
@@ -1419,8 +1653,20 @@ class DiffusionTransformerV2(nn.Module):
         if self.config.use_future_embedding:
             self.future_embeddings = nn.Embedding(config.num_future_embeddings, config.attention_head_dim * config.num_attention_heads)
             nn.init.normal_(self.future_embeddings.weight, mean=0.0, std=0.02)
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, global_cond: torch.Tensor, **kwargs):
+        
+        if self.config.use_goal_conditioning and self.config.use_task_specific_encoder:
+            self.goal_encoder = ConditionEmbedder(
+                n_tasks=self.config.n_tasks,
+                goal_dim=config.goal_dim,
+                embed_dim=config.obs_attention_head_dim * config.obs_num_attention_heads,
+            )
+            # self.goal_encoder = GoalEncoder(config.goal_dim + config.n_tasks + 1, config.attention_head_dim * config.num_attention_heads)
+        elif self.config.use_goal_conditioning and not self.config.use_task_specific_encoder:
+            self.goal_encoder = GoalEncoder(
+                goal_dim=config.goal_dim,
+                output_dim=config.attention_head_dim * config.num_attention_heads,
+            )
+    def forward(self, x: torch.Tensor, t: torch.Tensor, global_cond: torch.Tensor, goal: torch.Tensor | None = None, task_id: torch.Tensor | None = None, **kwargs):
         """
         Args:
             x: (B, T, input_dim) tensor for input to the decoder after embedding.
@@ -1444,95 +1690,71 @@ class DiffusionTransformerV2(nn.Module):
         ) # (B,To,n_cond)
 
         # split condition into states and observations in the last dimension
-        states, obs = torch.split(
-            cond,
-            [self.config.robot_state_feature.shape[0], self.cond_dim - self.config.robot_state_feature.shape[0]],
-            dim=-1
-        )
-        if self.config.n_obs_steps == 1:
-            obs = einops.rearrange(obs.squeeze(1), "b (n c) -> b n c", n=len(self.config.image_features), b=x.shape[0])  # (B, n_obs, obs_dim)
-            obs = self.obs_encoder(obs)  # (B, n_obs, n_emb)
 
-            states = self.state_encoder(states)  # (B, 1, n_emb)
-            obs = torch.cat([states, obs], dim=1)  # (B, To, n_emb)
+        if self.config.use_goal_conditioning and self.config.use_task_specific_encoder:
+            # goal_task_emb = self.goal_encoder(goal, task_id)
+            # task_onehot = F.one_hot(task_id, num_classes=self.config.n_tasks+1).float()  # (B, n_tasks + 1)
+            # goal = torch.cat([goal, task_onehot], dim=1)  # (B, goal_dim + n_tasks + 1)
+            # goal = goal.unsqueeze(1).repeat(1, cond.shape[1], 1)  # (B, To, goal_dim + n_tasks + 1)
+            # cond = torch.cat([cond, goal], dim=2)  # (B, To, n_cond + goal_dim + n_tasks + 1)
+            
+            task_onehot = F.one_hot(task_id, num_classes=self.config.n_tasks+1).float()  # (B, n_tasks + 1)
+            goal_task_emb = self.goal_encoder(goal, task_onehot)  # (B, embed_dim)
+            goal = torch.cat([goal, task_onehot], dim=1)  # (B, goal_dim + n_tasks + 1)
+            goal = goal.unsqueeze(1).repeat(1, cond.shape[1], 1)  # (B, To, goal_dim + n_tasks + 1)
+            cond = torch.cat([cond, goal], dim=2)  # (B, To, n_cond + goal_dim + n_tasks + 1)
+        elif self.config.use_goal_conditioning and not self.config.use_task_specific_encoder:
+            if self.training:
+                drop_mask = (torch.rand(goal.size(0), device=goal.device) < 0.1).long()
+                goal = goal * (1 - drop_mask).unsqueeze(1) # (B, goal_dim)
+            goal_emb = self.goal_encoder(goal) # (B, embed_dim)
+            goal = goal.unsqueeze(1).repeat(1, cond.shape[1], 1)  # (B, To, goal_dim)
+            cond = torch.cat([cond, goal], dim=2)  # (B, To, n_cond + goal_dim)
+            goal_task_emb = goal_emb
 
-            obs = self.obs_ln(obs)
-            obs = self.obs_attention(obs) # (B, To, n_emb)
+        cond = self.obs_encoder(cond)  # (B, To, n_emb)
+        cond = self.obs_ln(cond)
+        cond = self.obs_attention(cond) # (B, To, n_emb)
 
-            # project action features to transformer input dimension
-            x = self.action_encoder(x, t)  # (B, T, n_emb)
-            pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
-            pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)
-            x = x + pos_embs  # (B, T, n_emb)
-            sa_embs = x
+        x = self.action_encoder(x, t)
+        pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
+        pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)  # (1, T, n_emb)
+        x = x + pos_embs  # (B, T, n_emb)
 
-            encoder_attention_mask = torch.ones(cond.shape[1], dtype=torch.bool, device=x.device)  # (To,)
+        # states = self.state_encoder(states)  # (B, To, n_emb)
 
-            if self.config.use_future_embedding:
-                sa_embs, hidden_states = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=obs,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=t,
-                    return_all_hidden_states=True,
-                )
-            else:
-                sa_embs = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=obs,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=t,
-                    return_all_hidden_states=False,
-                )
-            pred = self.ln_f(sa_embs)  # (B, T, n_emb)
-            pred = self.head(pred)  # (B, T, n_inp)
-            return pred
+        # if self.config.use_future_embedding:
+        #     future_embeddings = self.future_embeddings.weight.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, n_future, n_emb)
+        #     sa_embs = torch.cat([states, x, future_embeddings], dim=1)  # (B, T + To + n_future, n_emb)
+        # else:
+        #     sa_embs = torch.cat([states, x], dim=1)  # (B, T + To, n_emb)
+        sa_embs = x
+        encoder_attention_mask = torch.ones(cond.shape[1], dtype=torch.bool, device=x.device)  # (To,)
+
+        if self.config.use_future_embedding:
+            sa_embs, hidden_states = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=obs,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t,
+                return_all_hidden_states=True,
+            )
         else:
-        # process observations
-            obs = self.obs_encoder(obs)  # (B, To, n_emb)
-            obs = self.obs_ln(obs)
-            obs = self.obs_attention(obs) # (B, To, n_emb)
+            sa_embs = self.model(
+                hidden_states=sa_embs,
+                # encoder_hidden_states=obs,
+                encoder_hidden_states=cond,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t,
+                return_all_hidden_states=False,
+                condition=goal_task_emb
+            )
 
-            # process observations
-            # cond = self.obs_encoder(cond)  # (B, To, n_emb)
-            # cond = self.obs_ln(cond)
-            # cond = self.obs_attention(cond) # (B, To, n_emb)
+        pred = self.ln_f(sa_embs)  # (B, T, n_emb)
+        # if self.config.use_task_specific_encoder:
+        #     pred = self.head(pred, t, task_id)  # (B, T, n_inp)
+        # else:
+        pred = self.head(pred)  # (B, T, n_inp)
 
-            # project action features to transformer input dimension
-            x = self.action_encoder(x, t)  # (B, T, n_emb)
-            pos_ids = torch.arange(x.shape[1], dtype=torch.long, device=x.device)  # (T,)
-            pos_embs = self.positional_embeddings(pos_ids).unsqueeze(0)  # (1, T, n_emb)
-            x = x + pos_embs  # (B, T, n_emb)
 
-            states = self.state_encoder(states)  # (B, To, n_emb)
-
-            if self.config.use_future_embedding:
-                future_embeddings = self.future_embeddings.weight.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, n_future, n_emb)
-                sa_embs = torch.cat([states, x, future_embeddings], dim=1)  # (B, T + To + n_future, n_emb)
-            else:
-                sa_embs = torch.cat([states, x], dim=1)  # (B, T + To, n_emb)
-            # sa_embs = x
-            encoder_attention_mask = torch.ones(cond.shape[1], dtype=torch.bool, device=x.device)  # (To,)
-
-            if self.config.use_future_embedding:
-                sa_embs, hidden_states = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=obs,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=t,
-                    return_all_hidden_states=True,
-                )
-            else:
-                sa_embs = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=obs,
-                    encoder_attention_mask=encoder_attention_mask,
-                    timestep=t,
-                    return_all_hidden_states=False,
-                )
-
-            pred = self.ln_f(sa_embs)  # (B, T, n_emb)
-            pred = self.head(pred)  # (B, T, n_inp)
-
-            return pred[:, -x.shape[1]:, :]  # return only the last T timesteps corresponding to the input x
-            # return pred
+        return pred

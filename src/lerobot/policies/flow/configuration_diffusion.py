@@ -130,8 +130,8 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    do_resize: bool = False
-    resize_shape: tuple[int, int] | None = (240, 320)
+    do_resize: bool = True
+    resize_shape: tuple[int, int] | None = (224, 224)
 
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
@@ -154,7 +154,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
-    tikhonov_weight: float | None = None
+    tikhonov_weight: float | None = 0.0
 
     # Training presets
     optimizer_lr: float = 1e-4
@@ -178,23 +178,29 @@ class DiffusionConfig(PreTrainedConfig):
     attention_head_dim: int = 64
     num_attention_heads: int = 16
     num_layers: int = 8
-    p_drop_attn: float = 0.3
+    p_drop_attn: float = 0.2
     final_dropout: bool = True
     norm_type: str = "ada_norm"
     output_dim: int = 1024
     interleave_self_attention: bool = True
-
     obs_attention_head_dim: int = 64
     obs_num_attention_heads: int = 16
     obs_num_layers: int = 4
-
-    #future embedding
-    use_future_embedding: bool = False
-    num_future_embeddings: int = 32
+    use_task_specific_encoder: bool | None = False
+    task_embedding_dim: int | None = 32
+    n_tasks: int | None = 3
 
     # flow matching huperparameters
     ode_step_size: float | None = None
+        #future embedding
+    use_future_embedding: bool = False
+    num_future_embeddings: int = 32
 
+
+    #goal conditioning
+    use_goal_conditioning: bool = False
+    goal_dim: int = 4
+    use_cfg: bool | None = False
 
     def __post_init__(self):
         super().__post_init__()
